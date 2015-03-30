@@ -1,0 +1,140 @@
+---
+title: "Solution"
+author: "Yuri Kulchisky"
+date: "30.03.2015"
+output:
+  html_document: default
+  pdf_document:
+    includes:
+      in_header: mystyles.sty
+    keep_tex: yes
+    latex_engine: xelatex
+---
+
+Подгружаем библиотеки
+
+```{r,libraries}
+library(dplyr,timeSeries)
+library(timeSeries)
+library(TTR)
+library(lubridate)
+library(zoo)
+library(xts)
+```
+
+Получаем данные.
+```{r}
+setwd("~/OneDrive/Documents/Work")
+load("wti.brent.RData")
+```
+Выгружаем данные по ценам на фьючерсы.
+```{r}
+brent <- select(brent.dataset,time,close)
+wti <- select(wti.dataset,time,close)
+```
+Конвертируем их в xts-формат.
+```{r}
+brent1 <- xts(brent$close, order.by=as.POSIXct(strptime(brent$time,"%Y-%m-%dT%H:%M:%S.000")))
+wti1 <- xts(wti$close, order.by=as.POSIXct(strptime(wti$time,"%Y-%m-%dT%H:%M:%S.000")))
+```
+Обрежем снизу и сверху общие для рядов NA и переведем данные в поминутные.
+```{r}
+lft <- max(time(first(wti1)),time(first(brent1)))
+rht <- min(time(last(wti1)),time(last(brent1)))
+
+brent2 <- brent1[time(brent1) %in% seq(lft,rht,by=60)]
+wti2 <- wti1[time(wti1) %in% seq(lft,rht,by=60)]
+```
+Сведем данные в один ряд.
+```{r}
+tickDataRaw <- as.xts(merge(brent2,wti2))
+```
+Удалим рабочие дни из данных, после чего аппроксимируем NA и установим имена для колонок.
+```{r}
+tickDataRaw_Work <- tickDataRaw[wday(time(tickDataRaw))<=5]
+tickData <- na.approx(tickDataRaw_Work)
+```
+Покажем, как работает аппроксимация (были только данные, обозначенные красным).
+```{r}
+par(col="blue",lwd=1)
+plot(tickData["2014-09-22"]$wti)
+par(col="red",lwd=2)
+lines(tickDataRaw_Work["2014-09-22"]$wti)
+```
+Продолжим.
+```{r}
+tickData <- tickData[time(tickData)<="2015-03-23 21:14:00"] # Потом объясним
+colnames(tickData) <- c("brent","wti")
+head(tickData)
+```
+Создадим ряд с отношением цен.
+```{r}
+r <- tickData$brent/tickData$wti
+```
+Нормализуем ряд с использованием скользящего среднего и стандартного отклонения с периодом, равным 10.
+```{r}
+mvPeriod <- 10
+r0 <- (r-EMA(r,n=mvPeriod))/runSD(r,n=mvPeriod)
+plot(r0[1:300],type="l")
+```
+Установим фиксированную границу, после которой будет создаваться сигнал на открытие/закрытие позиции. Сигнал, равный 1, будет означать, что мы должны купить или держать лонг-позицию по фьючерсу на Brent, сигнал, равный -1 -- наоборот, а нулевой сигнал будет соответствовать закрытию или отсутствию открытой позиции.
+```{r}
+thrhd <- 0.8
+sellSig <- -as.integer(r0>thrhd)
+buySig <- as.integer(r0< -thrhd)
+sig <- sellSig+buySig
+sigInTime <- xts(data.frame(signal=sig), order.by=time(tickData))
+```
+Объединим данные по ценам и сигналы.
+```{r}
+tradeData <- merge(tickData,sigInTime)
+```
+Напишем функцию, которая на основании двух дней будет считать доходность второго дня по отношению к первому.
+```{r}
+func2 <- function(day0,day1){
+  day <- day1
+  day0Book <- as.numeric(day0$wti)*as.numeric(day0$pos1)+
+    as.numeric(day0$brent)*as.numeric(day0$pos2)
+  day1Book <- as.numeric(day1$wti)*as.numeric(day0$pos1)+
+    as.numeric(day1$brent)*as.numeric(day0$pos2)
+  day$ret <- day1Book-day0Book
+  if (as.numeric(day1$signal)==as.numeric(day0$signal)) {
+    day$pos1 <- as.numeric(day0$pos1)
+    day$pos2 <- as.numeric(day0$pos2)
+  } else
+  if (as.numeric(day0$signal)-as.numeric(day1$signal)==2) {
+      day$pos1 <- day1Book/as.numeric(day1$signal*day1$brent)
+      day$pos2 <- -day1Book/as.numeric(day1$signal*day1$wti)
+    } else
+  if (abs(as.numeric(day1$signal))==1) {
+    day$pos1 <- 1/as.numeric(day1$signal*day1$brent)
+    day$pos2 <- -1/as.numeric(day1$signal*day1$wti)
+  }
+  return(day)
+}
+```
+Теперь создадим табличку исходных данных:
+```{r}
+myData <- tradeData
+myData$pos1 <- 0; myData$pos2 <- 0; myData$return <- 0;
+myData <- na.omit(myData)
+head(myData,20)
+```
+Преобразуем ее в список для работы функции Reduce.
+```{r,toList}
+#ldf2 <- lapply(as.list(1:dim(myData)[1]), function(x) myData[x[1],])
+```
+Применим функцию Reduce(), которая преобразует наш ряд, заменив в нем доходности с нулевых на реальные.
+```{r}
+#tvr2 <- Reduce(func2,ldf2,accumulate=TRUE)
+```
+Выделим из нее доходности
+```{r}
+#tvr3 <- sapply(tvr2,function(x) as.numeric(x$ret))
+```
+Вычислим общую доходность
+```{r}
+#Reduce(function(x,y) {(1+x)*(1+y)-1},tvr3)
+```
+
+В итоге пока что все не слишком хорошо.
